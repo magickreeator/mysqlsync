@@ -46,10 +46,10 @@ TMP=$$
 
 
 ### Temp files
-exclude_tables=`mktemp`
-include_tables=`mktemp`
-truncate_tables=`mktemp`
-mtime_cols=`mktemp`
+exclude_tables=`mktemp -t tmp.XXXXXXX`
+include_tables=`mktemp -t tmp.XXXXXXX`
+truncate_tables=`mktemp -t tmp.XXXXXXX`
+mtime_cols=`mktemp -t tmp.XXXXXXX`
 
 
 ### Functions
@@ -448,8 +448,8 @@ mtime_partition_with_prune() {
         echo "$TIME_MIN 0 $count_rem_lt_min $part_min $(mtime_partition_with_prune "$table" "$conn_loc" "$conn_rem" $mtime_col $depth $part_min $part_max) $part_max 0 $count_rem_gt_max $TIME_MAX"
     else
         # Intervals are closed on the bottom, because we're unlikely to hit TIME_MAX, but we'll probably hit TIME_MIN (0)
-        local cnt_file_loc=`mktemp $TMP.XXXXXXX`
-        local cnt_file_rem=`mktemp $TMP.XXXXXXX`
+        local cnt_file_loc=`mktemp -t $TMP.XXXXXXX`
+        local cnt_file_rem=`mktemp -t $TMP.XXXXXXX`
         
         echo "select count(1) from $table where $mtime_col >= $part_min and $mtime_col < $part_max;" | eval "mysql -NB $conn_loc" > $cnt_file_loc &
         local pid_loc=$!
@@ -1015,7 +1015,9 @@ this, please fix the data in your source database first.
 "
 
 if which getopt >/dev/null; then
-    eval set -- "$(getopt -n $PROGRAM_NAME -s bash -l help,version,mtime-col:tmpdir:,struct-check-only,drop-tables,delete,cache-checksums,skip-table:,skip-pattern:,truncate-table:,truncate-pattern:,only:,threads:,threads-local:,threads-remote: hVm:t:s:o: "$@")"
+    # TODO: Temporarily reverting to simpler behaviour until I figure out how to make it work on OS X too
+    #eval set -- "$(getopt -n $PROGRAM_NAME -s bash -l help,version,mtime-col:tmpdir:,struct-check-only,drop-tables,delete,cache-checksums,skip-table:,skip-pattern:,truncate-table:,truncate-pattern:,only:,threads:,threads-local:,threads-remote: hVm:t:s:o: "$@")"
+    eval set -- "$(getopt hVm:t:s:o: "$@")"
 fi
 
 while [[ ${1:0:1} == - ]]; do
