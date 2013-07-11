@@ -25,6 +25,7 @@ Usage
 mysqlsync [OPTIONS] USER1[/PASS1]@HOST1:DB1 USER2[/PASS2]@HOST2:DB2
 
 OPTIONS:
+
     --struct-check-only
         Only check for different structures, do not inspect or change table data
         at all. Useful for minor structure differences you want to handle
