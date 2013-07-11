@@ -1,0 +1,1249 @@
+#!/bin/bash
+#
+# Author: Janos Barbero
+#
+# NB. We use 3 as the stderr stream in the code, rather than the usual 2, to avoid interfering with pv. At the very end (in the xargs call) we do pipe &3 back to &2
+
+# TODO: just get the table size as a first cut. If they are the same, you still need to checksum, but if they're different, you know you need to sync
+
+### Export all variables and functions
+set -a
+
+### Constants
+PROGRAM_NAME="mysqlsync"
+VERSION_STR="$PROGRAM_NAME version 1.4"
+TIME_MIN=0
+TIME_MAX=2147414400
+# Actual partitions will be on average half PARTITION_MAX_SIZE
+# It's better to use an average partition size of 100k, as though you have to go a few levels deeper in partitioning, there is less chance of the process being interrupted.
+PARTITION_MAX_SIZE=200000
+
+### Defaults
+DEBUG_LEVEL=5
+L_ALL=0
+L_WARN=1
+L_STAT=2
+L_INFO=3
+L_DETAIL=4
+L_TRACE=5
+STAGING=${TMPDIR:-/tmp}
+DROP_TABLES=
+DELETE_REMOTE=
+CACHE_CKSUMS=
+SYNC_THREADS=4
+THREADS_LOCAL=$SYNC_THREADS
+THREADS_REMOTE=$SYNC_THREADS
+STRUCT_CHECK_ONLY=
+DIFF_ALGO=comm
+CHARSET=utf8
+# TODO: NET_BUF_LEN=1073741824
+NET_BUF_LEN=16777216
+MAX_ALLOWED_PKT=1073741824
+MYSQLDUMP_DEFAULTS="--compact --compress --skip-comments --create-options --single-transaction --disable-keys --lock-tables --quick --default-character-set=$CHARSET --set-charset"
+PV_OPTS="-Wberptc"
+#PV_OPTS="-ebrptc"
+TMP=$$
+
+
+### Temp files
+exclude_tables=`mktemp`
+include_tables=`mktemp`
+truncate_tables=`mktemp`
+mtime_cols=`mktemp`
+
+
+### Functions
+
+# General functions
+
+# On exit...
+cleanup() {
+    # Remove temp files
+    rm -rf "$exclude_tables" "$include_tables" "$truncate_tables" "$mtime_cols" $STAGING/$TMP.*
+
+    # And kill children
+    kill -s HUP 0
+}
+trap cleanup EXIT
+
+
+# Debug notice
+# Usage: notice LEVEL MESSAGE
+# The message is shown if the level is less than or equal to the debug level.
+notice() {
+    level=${1:-0}
+    [[ $level -gt $DEBUG_LEVEL ]] && return
+    shift
+    echo "[$(date)] [$level] $@"
+}
+
+
+# Progress meter
+PV_PATH=$(which pv 2>/dev/null)
+if pv -m </dev/null &>/dev/null; then
+    PV_LINEBLOCKMODE=1
+else
+    PV_LINEBLOCKMODE=0
+fi
+pvwrap() {
+    if [[ $PV_PATH != "" ]]; then
+        pv_opt="$PV_OPTS"
+        if [[ $PV_LINEBLOCKMODE == 1 ]]; then
+            pv_opt="$PV_OPTS -m ${2:+ -s $2}"
+        fi
+        notice 5 "pv $pv_opt -N\"$1\"" >&3
+        pv $pv_opt -N"$1"
+    else
+        cat
+    fi
+}
+
+
+# Parse connect handle and return mysql client option string
+function parse_connstr {
+    if [[ $1 =~ .+/.+@.+:.+ ]]; then
+        IFS="/@:" read user pass host db <<< "$1"
+        echo "-h $host -u $user --password='$pass' $db:$host.$db"
+    elif [[ $1 =~ .+@.+:.+ ]]; then
+        IFS="@:" read user host db <<< "$1"
+        echo "-h $host -u $user $db:$host.$db"
+    else
+        echo "Error: invalid connect string '$1'" >&2
+        exit 2
+    fi
+}
+
+# Sleep for a random number of seconds in some interval. Right now we sleep between 1 and 4 seconds.
+sleep_random() {
+    sleep $((1 + (RANDOM % 4) ))
+}
+
+# Acquire a lock in a certain class; blocking
+function wait_lock() {
+    local lock_type=$1
+    local max_slots=${2:-$SYNC_THREADS}
+
+    while true; do
+        # Look for a free slot
+        for ((i=1; i<=$max_slots; i++)); do
+            if mkdir $TMP.$lock_type.$i 2>/dev/null; then
+                notice $L_TRACE "Acquiring lock $TMP.$lock_type.$i" >&2
+                echo $TMP.$lock_type.$i
+                break 2 # Break 2 levels
+            fi
+        done
+
+        sleep_random
+    done
+}
+
+# Release a lock
+function release_lock() {
+    local lock_name=$1
+
+    notice $L_TRACE "Releasing lock $lock_name" >&3
+    rm -rf $lock_name
+}
+
+# A small bit of test code for the locks, more to play around with than for real testing
+function test_locks_trivial() {
+    notice $L_ALL "This is a test"
+    SYNC_THREADS=4
+
+    for ((i=1; i<=20; i++)); do
+        {
+            l_loc=$(wait_lock loc)
+            l_rem=$(wait_lock rem)
+            notice $L_ALL "Entering monitor $i..."
+            ls -d $TMP.loc.* $TMP.rem.*
+            release_lock $l_loc
+            release_lock $l_rem
+        } &
+    done
+
+    wait
+
+    exit 127
+}
+
+# Get/set properties in a file store
+get_prop() {
+    file="$1"
+    key="$2"
+
+    [[ -f $file ]] && cat "$file" | awk '$1 == "'"$key"'" {print $2}'
+}
+
+set_prop() {
+    file="$1"
+    key="$2"
+    val="$3"
+
+    if [[ -f $file ]]; then
+        lock=$(wait_lock cachefile 1)
+
+        {
+            cat "$file"
+            echo "$key $val"
+        } | awk '{val[$1]=$2} END {for(k in val) print k, val[k]}' | sort > $file.tmp && mv $file.tmp $file
+
+        release_lock $lock
+    fi
+}
+
+# Typically used to invalidate cache entries
+del_prop() {
+    file="$1"
+    key="$2"
+
+    if [[ -f $file ]]; then
+        lock=$(wait_lock cachefile 1)
+
+        sed -i "/^$key /d" "$file"
+
+        release_lock $lock
+    fi
+}
+
+
+# MySQL client functions with thread handling
+
+# Normalise mysql output a little
+norm_mysql() {
+    tr A-Z a-z |
+    sed -e 's/\\n/\n/g' \
+        -e 's/[ \t][ \t]*/ /g' \
+        -e 's/\(engine\|auto_increment\|default charset\)=/\n\1=/g'
+}
+
+# Check whether a table is empty. Echo 1 for empty, 0 for nonempty.
+function is_empty() {
+    local table="$1"
+    local conn="$2"
+
+    local result=$(echo "select 0 from $table limit 1;" | eval "mysql -NB $conn")
+
+    echo ${result:-1}
+}
+
+# Truncate a table
+function truncate_table() {
+    local table="$1"
+    local conn="$2"
+    local cache="$3"
+
+    local mtime_col="$4"
+    local part_min="$5"
+    local part_max="$6"
+
+    local notice_msg="Truncating table $table"
+    if [[ $mtime_col != "" && $part_min != "" && $part_max != "" ]]; then
+        notice_msg="$notice_msg, partition [$part_min, $part_max)"
+    fi
+    notice $L_INFO "$notice_msg"
+
+    if [[ $mtime_col == "" || $part_min == "" || $part_max == "" ]]; then
+        echo "truncate $table;" | eval "mysql $conn"
+    else
+        echo "delete from $table where $mtime_col >= $part_min and $mtime_col < $part_max;" | eval "mysql $conn"
+    fi
+    
+    # Invalidate cache
+    del_prop "$cache" "$table"
+}
+
+# Drop a table
+function drop_table() {
+    local table="$1"
+    local conn="$2"
+    local cache="$3"
+
+    echo "drop table if exists $table;" | eval "mysql $conn"
+    
+    # Invalidate cache
+    del_prop "$cache" "$table"
+}
+
+# Get keys from a table
+function get_keys() {
+    local table="$1"
+    local conn="$2"
+
+    # TODO: check for any unique keys using ``show keys''
+    echo "show columns from $table;" | eval "mysql -NB $conn" | awk -F'\t' '$4 == "PRI" {printf $1" "NR" "}'
+}
+
+# Get auto_increment column in a table
+function get_autoinc() {
+    local table="$1"
+    local conn="$2"
+
+    echo "show columns from $table where \`Extra\` like '%auto_increment%';" | eval "mysql -B $conn" | tr A-Z a-z | awk 'NR==1{for(i=1; i<=NF; i++) if($i ~ /field/) break; } NR==2 {print $i}'
+}
+
+# Copy table structure (i.e. drop and re-create table)
+function copy_table_structure() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+
+    # Drop remote table
+    drop_table "$table" "$conn_rem" "$cache_rem"
+
+    # Get local table structure
+    echo "show create table $table;" | eval "mysql -NB $conn_loc" | sed -e 's/.*\(create table\)/\1/i' -e 's/\\n/\n/g' > $TMP.$table.structure
+    
+    # Set auto-increment column to zero
+    sed -i 's/\(auto_increment\)=[0-9]*/\1=0/gi' $TMP.$table.structure
+
+    # Copy to remote table
+    cat $TMP.$table.structure | eval "mysql -NB $conn_rem" 2>$TMP.$table.copy_struc_err
+
+    if [[ -s $TMP.$table.copy_struc_err ]]; then
+        notice $L_ALL "Error while copying table structure of $table $(cat $TMP.$table.copy_struc_err | wc -l) lines):"
+        cat -n $TMP.$table.copy_struc_err
+    fi
+
+    rm -f $TMP.$table.copy_struc_err
+
+    # Superfluous after the drop, but why not -- invalidate cache
+    del_prop "$cache_rem" "$table"
+}
+
+# Sync table auto_increment values
+function sync_autoinc() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+
+    notice $L_STAT "Syncing value of auto_increment column in $table"
+    local autoinc_loc=$(echo "show table status where Name='rpusers';" | eval "mysql -B $conn_loc" | tr A-Z a-z | awk 'NR==1{for(i=1; i<=NF; i++) if($i ~ /auto_increment/) break; } NR==2 {print $i}')
+
+    if [[ $autoinc_loc != "" ]]; then # There's an auto_increment value to sync
+        local autoinc_rem=$(echo "show table status where Name='rpusers';" | eval "mysql -B $conn_rem" | tr A-Z a-z | awk 'NR==1{for(i=1; i<=NF; i++) if($i ~ /auto_increment/) break; } NR==2 {print $i}')
+
+        if [[ $autoinc_loc != $autoinc_rem ]]; then # The auto_increment values differ
+
+            # Sync them
+            echo "alter table $table auto_increment = $autoinc_loc;" | eval "mysql -NB $conn_rem"
+
+            # Invalidate cache
+            del_prop "$cache" "$table"
+        fi
+    fi
+}
+
+# Sync table structures
+function sync_table_structures() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+
+    # Ignore auto_increment differences in structure comparison
+    echo "show create table $table;" | eval "mysql -NB $conn_loc" | norm_mysql | grep -v '^auto_increment=' > $TMP.$table.struc_loc
+    echo "show create table $table;" | eval "mysql -NB $conn_rem" | norm_mysql | grep -v '^auto_increment=' > $TMP.$table.struc_rem
+
+    if ! diff $TMP.$table.struc_loc $TMP.$table.struc_rem > $TMP.$table.struc_cmp; then
+        notice $L_INFO "Difference detected in structure of $table"
+        if [[ $STRUCT_CHECK_ONLY == 1 ]]; then
+            notice $L_ALL "--struct-check-only given; not syncing table sturcture"
+            cat $TMP.$table.struc_cmp
+        else
+            # If they differ, drop the remote table and copy the structure to it
+            copy_table_structure "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+        fi
+    else
+        # If the structures agree, just sync the auto_increment values
+        sync_autoinc "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+    fi
+
+    rm -f $TMP.$table.struc_loc $TMP.$table.struc_rem $TMP.$table.struc_cmp
+}
+
+# Partition a table by mtime
+# Prints a sequence of the form BOUND-TIME NUM-ENTRIES BOUND-TIME NUM-ENTRIES ... NUM-ENTRIES BOUND-TIME,
+# with the partition bounds and the number of rows in each partition between the bounds
+mtime_partition() {
+    local table="$1"
+    local conn_loc="$2"
+    local mtime_col="$3"
+    local depth="$4"
+
+    local part_min="$5"
+    local part_max="$6"
+
+    ((depth++))
+
+    notice $L_TRACE "mtime_partition: $@" >&3
+
+    if [[ $part_min == "" || $part_max == "" ]]; then
+        part_min=$(echo "select min($mtime_col) from $table;" | eval "mysql -NB $conn_loc")
+        part_max=$(echo "select max($mtime_col) from $table;" | eval "mysql -NB $conn_loc")
+
+        if [[ $part_min == "" || $part_max == "" ]]; then
+            notice $L_ALL "Failed to determine a partitioning of $table: getting min, max failed" >&3
+            # But don't exit with an error condition
+            return
+        fi
+
+        echo "$TIME_MIN 0 $part_min $(mtime_partition "$table" "$conn_loc" $mtime_col $depth $part_min $part_max) $part_max 0 $TIME_MAX"
+    else
+        # Intervals are closed on the bottom, because we're unlikely to hit TIME_MAX, but we'll probably hit TIME_MIN (0)
+        local count=$(echo "select count(1) from $table where $mtime_col >= $part_min and $mtime_col < $part_max;" | eval "mysql -NB $conn_loc")
+        
+        if [[ $count == "" ]]; then
+            notice $L_ALL "Failed to determine a partitioning of $table: count in [$part_min, $part_max) failed" >&3
+            return
+        fi
+
+        notice $L_TRACE "$table local [$part_min, $part_max); [$(date -d@$part_min), $(date -d@$part_max)): $count" >&3
+
+        if [[ $count -le $PARTITION_MAX_SIZE ]]; then
+            echo "$count"
+        else
+            local part_mid=$(( (part_min + part_max) / 2 ))
+            if [[ $part_mid != $part_min && $part_mid != $part_max ]]; then
+                echo "$(mtime_partition "$table" "$conn_loc" $mtime_col $depth $part_min $part_mid) $part_mid $(mtime_partition "$table" "$conn_loc" $mtime_col $depth $part_mid $part_max)"
+            else
+                echo ""
+            fi
+        fi
+    fi
+}
+
+# Partition a table by mtime, but prune paths where counts agree in the local and remote databases
+# Prints a sequence of the form BOUND-TIME NUM-ENTRIES-LOC NUM-ENTRIES-REM BOUND-TIME NUM-ENTRIES-LOC NUM-ENTRIES-REM ... NUM-ENTRIES-LOC NUM-ENTRIES-REM BOUND-TIME,
+# with the partition bounds and the number of rows in each partition between the bounds
+# Intervals are closed on the bottom and open at the top: [A, B)
+mtime_partition_with_prune() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local mtime_col="$4"
+    local depth="$5"
+
+    local part_min="$6"
+    local part_max="$7"
+
+    ((depth++))
+
+    notice $L_TRACE "mtime_partition_with_prune: $table on $mtime_col depth=$depth min=$part_min max=$part_min" >&3
+
+    if [[ $part_min == "" || $part_max == "" ]]; then
+        part_min=$(echo "select min($mtime_col) from $table;" | eval "mysql -NB $conn_loc")
+        part_max=$(echo "select max($mtime_col)+1 from $table;" | eval "mysql -NB $conn_loc")
+
+        local count_rem_lt_min=$(echo "select count(1) from $table where $mtime_col < $part_min;" | eval "mysql -NB $conn_rem")
+        local count_rem_gt_max=$(echo "select count(1) from $table where $mtime_col >= $part_max;" | eval "mysql -NB $conn_rem")
+
+        if [[ $part_min == "" || $part_max == "" ]]; then
+            notice $L_ALL "Failed to determine a partitioning of $table: getting min, max failed" >&3
+            # But don't exit with an error condition
+            return
+        fi
+
+        echo "$TIME_MIN 0 $count_rem_lt_min $part_min $(mtime_partition_with_prune "$table" "$conn_loc" "$conn_rem" $mtime_col $depth $part_min $part_max) $part_max 0 $count_rem_gt_max $TIME_MAX"
+    else
+        # Intervals are closed on the bottom, because we're unlikely to hit TIME_MAX, but we'll probably hit TIME_MIN (0)
+        local cnt_file_loc=`mktemp $TMP.XXXXXXX`
+        local cnt_file_rem=`mktemp $TMP.XXXXXXX`
+        
+        echo "select count(1) from $table where $mtime_col >= $part_min and $mtime_col < $part_max;" | eval "mysql -NB $conn_loc" > $cnt_file_loc &
+        local pid_loc=$!
+        echo "select count(1) from $table where $mtime_col >= $part_min and $mtime_col < $part_max;" | eval "mysql -NB $conn_rem" > $cnt_file_rem &
+        local pid_rem=$!
+
+        if [[ $pid_loc != "" && $pid_rem != "" ]]; then
+            wait $pid_loc $pid_rem
+        fi
+
+        local count_loc=`cat $cnt_file_loc`
+        local count_rem=`cat $cnt_file_rem`
+
+        rm -f $cnt_file_loc $cnt_file_rem
+
+        if [[ $count_loc == "" ]]; then
+            notice $L_ALL "Failed to determine a partitioning of $table: count in [$part_min, $part_max) failed" >&3
+            return
+        fi
+
+        notice $L_TRACE "$table local [$part_min, $part_max); [$(date -d@$part_min), $(date -d@$part_max)): $count_loc ; remote: $count_rem" >&3
+
+        if [[ $count_loc -le $PARTITION_MAX_SIZE || $count_loc == $count_rem ]]; then
+            echo "$count_loc" "$count_rem"
+        else
+            local part_mid=$(( (part_min + part_max) / 2 ))
+            if [[ $part_mid != $part_min && $part_mid != $part_max ]]; then
+                echo "$(mtime_partition_with_prune "$table" "$conn_loc" "$conn_rem" $mtime_col $depth $part_min $part_mid) $part_mid $(mtime_partition_with_prune "$table" "$conn_loc" "$conn_rem" $mtime_col $depth $part_mid $part_max)"
+            else
+                echo ""
+            fi
+        fi
+
+        rm -f $cnt_file_loc $cnt_file_rem
+    fi
+}
+
+# Sync any columns where the auto_increment value is 0 or NULL
+function sync_autoinc_invalid_rows() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local autoinc_col="$4"
+
+    notice $L_STAT "Checking for any invalid auto_increment values in $table"
+
+    # Delete any invalid rows in remote table
+    echo "delete from $table where $autoinc_col is null or $autoinc_col = 0;" | eval "mysql -NB $conn_rem"
+
+    # Unfortunately these can't be copied over safely, or at least not in any fashion that isn't hideously complicated. So we ignore these (non-compliant!) rows.
+    #eval "mysqldump --compact --add-locks --extended-insert --no-create-info --lock-tables --quick --set-charset --single-transaction --default-character-set=$CHARSET -w '$autoinc_col is null or $autoinc_col = 0' $conn_loc $table" | tee /tmp/pret | eval "mysql -C -NB $conn_rem"
+}
+
+# Copy contents of local table into empty remote table
+function copy_table() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+    
+    # Optional args
+    local mtime_col="$5"
+    local part_min="$6"
+    local part_max="$7"
+    local total_rows="$8"
+
+    local lock_loc=$(wait_lock loc $THREADS_LOCAL)
+    local lock_rem=$(wait_lock rem $THREADS_REMOTE)
+
+    local mysqldump_where=
+    local partition_notice="$table"
+    if [[ $mtime_col != "" && $part_min != "" && $part_max != "" ]]; then
+        mysqldump_where="$mtime_col>=$min_time&&$mtime_col<$max_time"
+        mysqldump_extra_clause="-w '$mtime_col>=$min_time&&$mtime_col<$max_time'"
+        partition_notice="$table partition [$min_time, $max_time)"
+    fi
+    
+    # Make sure the remote table is empty: truncate it
+    notice $L_INFO "Truncating table $partition_notice in remote database"
+    truncate_table "$table" "$conn_rem" "$cache_rem" $mtime_col $part_min $part_max
+
+    # Workaround to 0 or NULL values in auto_increment columns
+    # Is there an auto_increment column?
+    local autoinc_col=$(get_autoinc "$table" "$conn_loc")
+    if [[ $autoinc_col != "" ]]; then # There is an auto_increment column, we have to check
+        sync_autoinc_invalid_rows "$table" "$conn_loc" "$conn_rem" "$autoinc_col"
+        local mysqldump_autoinc_clause="$autoinc_col > 0"
+        if [[ $mysqldump_where == "" ]]; then
+            mysqldump_where="($mysqldump_autoinc_clause)"
+        else
+            mysqldump_where="($mysqldump_where) and ($mysqldump_autoinc_clause)"
+        fi
+    fi
+
+    local mysqldump_extra_clause=
+    if [[ $mysqldump_where != "" ]]; then
+        mysqldump_extra_clause="-w '$mysqldump_where'"
+    fi
+
+    notice $L_STAT "Copying rows in $partition_notice to remote database"
+    eval "mysqldump --compact --add-locks --disable-keys --extended-insert --no-create-info --lock-tables --quick --set-charset $MYSQLDUMP_OPTS $mysqldump_extra_clause $conn_loc $table" | tee /tmp/lala | pvwrap "$table copy" $total_rows | eval "mysql -C -NB $conn_rem" 2>$TMP.$table.copy_err
+
+    if [[ -s $TMP.$table.copy_err ]]; then
+        notice $L_ALL "Error while copying table $partition_notice $(cat $TMP.$table.copy_err | wc -l) lines):"
+        cat -n $TMP.$table.copy_err
+    else
+        notice $L_INFO "Copy of table $partition_notice finished"
+    fi
+
+    rm -f $TMP.$table.copy_err
+
+    # Invalidate cache
+    del_prop "$cache_rem" "$table"
+
+    release_lock $lock_loc
+    release_lock $lock_rem
+}
+
+# Delta sync algorithm for a table or partition
+function sync_partition_delta() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+
+    local mtime_col="$5"
+    local part_min="$6"
+    local part_max="$7"
+
+    local mysqldump_extra_clause=
+    local partition_notice="$table"
+    if [[ $mtime_col != "" && $part_min != "" && $part_max != "" ]]; then
+        mysqldump_extra_clause="-w '$mtime_col>=$min_time&&$mtime_col<$max_time'"
+        partition_notice="$table partition [$min_time, $max_time)"
+    fi
+
+    if [[ $table == "" ]]; then
+        echo "FATAL ERROR: \$table empty! Args were: $@"
+        exit 127
+    fi
+
+    local keys=$(get_keys "$table" "$conn_rem")
+    if [[ $keys == "" ]]; then
+        notice $L_INFO "No primary key defined on $partition_notice, copying contents wholesale..."
+        
+        copy_table "$table" "$conn_loc" "$conn_rem" "$cache_rem" $mtime_col $part_min $part_max
+
+        # Invalidate cache
+        del_prop "$cache_rem" "$table"
+
+    else
+        touch $TMP.$table.del $TMP.$table.ins
+
+        notice $L_INFO "Fetching $partition_notice contents for comparison..."
+
+        # Get local data
+        {
+            lock_loc=$(wait_lock loc $THREADS_LOCAL)
+            notice $L_DETAIL "Fetching $partition_notice data from local database for comparison..."
+            eval "mysqldump --no-create-info --skip-extended-insert --compact $MYSQLDUMP_OPTS $mysqldump_extra_clause $conn_loc $table" > $TMP.$table.loc_data
+            notice $L_DETAIL "Got $partition_notice data from local database for comparison..."
+            release_lock $lock_loc
+        } &
+        local pid_loc=$!
+
+        # Get remote data
+        {
+            lock_rem=$(wait_lock rem $THREADS_REMOTE)
+            notice $L_DETAIL "Fetching $partition_notice data from remote database for comparison..."
+            eval "mysqldump --no-create-info --skip-extended-insert --compact $MYSQLDUMP_OPTS $mysqldump_extra_clause $conn_rem $table" > $TMP.$table.rem_data
+            notice $L_DETAIL "Got $partition_notice data from remote database for comparison..."
+            release_lock $lock_rem
+        } &
+        local pid_rem=$!
+
+        # Wait for datasets to come in
+        if [[ $pid_loc != "" && $pid_rem != "" ]]; then
+            wait $pid_loc $pid_rem
+        fi
+        
+        notice $L_INFO "Diffing $partition_notice contents..."
+
+        # NB. Delete statements might use the partition bounds -- but they're already keyed, so there's not much point.
+
+        # TODO: construct longer delete, insert lines for faster sync
+        if [[ $DIFF_ALGO == diff ]]; then
+            read delrows insrows < <(diff $TMP.$table.loc_data $TMP.$table.rem_data | awk -vkeystr="$keys" '
+                BEGIN {
+                    split(keystr, keystr_entries, " ")
+                    for(i=1; i<=length(keystr_entries); i+=2)
+                        keys[keystr_entries[i]] = keystr_entries[i+1]
+                }
+                $1 == "<" {
+                    ins++
+                    print substr($0, 3) > "'$TMP.$table.ins'"
+                }
+                $1 == ">" {
+                    del++
+                    left = index($0, "(") + 1
+                    right = index($0, ")")
+                    split(substr($0, left, right-left), vals, ",") # Crudity itself, commas unaccounted for. TODO. (Works well in practice because of typical ordering of columns.)
+                    first = 0;
+                    for(k in keys) {
+                        if(first++ == 0)
+                            printf "DELETE FROM `'$table'` WHERE %s = %s", k, vals[keys[k]] > "'$TMP.$table.del'"
+                        else
+                            printf " AND %s = %s", k, vals[keys[k]] > "'$TMP.$table.del'"
+                    }
+                    printf ";\n" > "'$TMP.$table.del'"
+                }
+                END {
+                    printf "%d %d\n", del, ins
+                }
+            ')
+
+        elif [[ $DIFF_ALGO == comm ]]; then
+            read delrows insrows < <(comm -3 $TMP.$table.loc_data $TMP.$table.rem_data | awk -F'\t' -vkeystr="$keys" '
+                BEGIN {
+                    split(keystr, keystr_entries, " ")
+                    for(i=1; i<=length(keystr_entries); i+=2)
+                        keys[keystr_entries[i]] = keystr_entries[i+1]
+                }
+                NF == 1 && $1 ~ /^INSERT / {
+                    ins++
+                    print $1 > "'$TMP.$table.ins'"
+                }
+                NF == 2 && $1 == "" && $2 ~ /^INSERT / {
+                    del++
+                    left = index($2, "(") + 1
+                    right = index($2, ")")
+                    split(substr($2, left, right-left), vals, ",") # Crudity itself, commas unaccounted for. TODO. (Works well in practice because of typical ordering of columns.)
+                    first = 0;
+                    for(k in keys) {
+                        if(first++ == 0)
+                            printf "DELETE FROM `'$table'` WHERE %s = %s", k, vals[keys[k]] > "'$TMP.$table.del'"
+                        else
+                            printf " AND %s = %s", k, vals[keys[k]] > "'$TMP.$table.del'"
+                    }
+                    printf ";\n" > "'$TMP.$table.del'"
+                }
+                END {
+                    printf "%d %d\n", del, ins
+                }
+            ')
+
+        fi
+        
+        local total_rows=$(cat $TMP.$table.loc_data | wc -l)
+        # If the number of rows to delete is greater than 50% of the rows in the local table, just do a straight copy
+        local rows_thld=$(echo "$total_rows / 2" | bc)
+
+        # These intermediate files can be large, let's delete them right away
+        rm -f $TMP.$table.loc_data $TMP.$table.rem_data
+
+        if [[ $delrows -ge $rows_thld ]]; then
+            notice $L_DETAIL "Over half the rows in $partition_notice changed; doing a wholesale copy of $total_rows rows..."
+        
+            copy_table "$table" "$conn_loc" "$conn_rem" "$cache_rem" $mtime_col $part_min $part_max $total_rows
+
+            # Invalidate cache
+            del_prop "$cache_rem" "$table"
+        
+        else
+            if [[ -s $TMP.$table.del || -s $TMP.$table.ins ]]; then
+                local lock_rem=$(wait_lock rem $THREADS_REMOTE)
+
+                if [[ -s $TMP.$table.del ]]; then
+                    notice $L_INFO "Deleting $delrows non-matching rows in remote table $partition_notice ..." >&3
+
+                    {
+                        echo "CHARSET $CHARSET;"
+                        echo 'LOCK TABLES `'$table'` WRITE;'
+
+                        cat $TMP.$table.del
+
+                        echo 'UNLOCK TABLES;'
+
+                    } | pvwrap "$table del" $((delrows+3)) | eval "mysql -C -NB $conn_rem"
+                fi
+                
+                if [[ -s $TMP.$table.ins ]]; then
+                    notice $L_INFO "Inserting $insrows changed rows into remote table $partition_notice ..." >&3
+
+                    {
+                        echo "CHARSET $CHARSET;"
+                        echo 'LOCK TABLES `'$table'` WRITE;'
+                        echo '/*!40000 ALTER TABLE `'$table'` DISABLE KEYS */;'
+
+                        cat $TMP.$table.ins
+
+                        echo '/*!40000 ALTER TABLE `'$table'` ENABLE KEYS */;'
+                        echo 'UNLOCK TABLES;'
+
+                    } | pvwrap "$table ins" $((insrows+5)) | eval "mysql -C -NB $conn_rem"
+                fi
+
+                # TODO
+                if [[ -s $TMP.$table.sync_err ]]; then
+                    notice $L_ALL "Error while copying table contents of $partition_notice ($(cat $TMP.$table.sync_err | wc -l) lines):"
+                    cat -n $TMP.$table.sync_err
+                    head $TMP.$table.del $TMP.$table.ins
+                else
+                    notice $L_STAT "Finished syncing $partition_notice"
+                fi
+
+                rm -f $TMP.$table.sync_err
+
+                release_lock $lock_rem
+
+                # Invalidate cache
+                del_prop "$cache_rem" "$table"
+            else
+                notice $L_INFO "Contents of $partition_notice were identical; sync finished"
+
+                local ret_code=1
+            fi
+        fi
+
+        rm -f $TMP.$table.ins $TMP.$table.del
+
+    fi
+}
+
+# Sync contents of non-empty local and remote tables
+function sync_table_contents() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_rem="$4"
+
+    local ret_code=0
+
+    # Is it a partitionable table?
+    if [[ $(get_prop $mtime_cols $table) != "" ]]; then
+        notice $L_DETAIL "$table has an mtime field defined, trying to partition"
+        local mtime_col=$(get_prop $mtime_cols $table)
+
+        # Partition table
+        local lock_loc=$(wait_lock loc $THREADS_LOCAL)
+        declare -a partitions
+        local partitions=( $(mtime_partition_with_prune "$table" "$conn_loc" "$conn_rem" $mtime_col) )
+
+        # Go through partitions
+        lock_rem=$(wait_lock rem $THREADS_REMOTE)
+        local min_time= max_time= cnt_loc= cnt_rem=
+        for((i=1; i<${#partitions[@]}; i+=3)); do
+            min_time=${partitions[$i-1]}
+            cnt_loc=${partitions[$i]}
+            cnt_rem=${partitions[$i+1]}
+            max_time=${partitions[$i+2]}
+            
+            notice $L_INFO "Syncing partition $((i/3+1)) of $((${#partitions[@]}/3)) in table $table [$min_time, $max_time) with $cnt_loc local rows and $cnt_rem remote rows"
+
+            if [[ $cnt_loc != $cnt_rem ]]; then
+                if [[ $cnt_loc == 0 ]]; then
+                    notice $L_STAT "$cnt_loc in local partition, but $cnt_rem in remote; truncating..."
+                    truncate_table "$table" "$conn_rem" "$cache_rem" $mtime_col $min_time $max_time
+
+                elif [[ $cnt_rem == 0 ]]; then
+                    notice $L_STAT "$cnt_loc in local partition, but $cnt_rem in remote; copying..."
+
+                    copy_table "$table" "$conn_loc" "$conn_rem" "$cache_rem" $mtime_col $min_time $max_time
+
+                else
+                    notice $L_INFO "$cnt_loc in local partition, but $cnt_rem in remote; syncing..."
+                    notice $L_STAT "Differing data in $table [$min_time, $max_time) partition, syncing..."
+                    sync_partition_delta "$table" "$conn_loc" "$conn_rem" "$cache_rem" $mtime_col $min_time $max_time
+                fi
+            else
+                notice $L_INFO "Counts for $table [$min_time, $max_time) agree: $cnt_loc, not syncing"
+            fi
+        done
+
+        release_lock $lock_rem
+        release_lock $lock_loc
+    else
+        notice $L_STAT "Syncing all of table $table"
+        sync_partition_delta "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+    fi
+
+    ### TODO ### if ! sync_table_contents "$table" "$conn_loc" "$conn_rem" "$cache_rem"; then
+    ### TODO ###     # If they were identical, invalidate the local cache line as well
+    ### TODO ###     # Invalidate caches
+    ### TODO ###     del_prop "$cache_loc" "$table"
+    ### TODO ###     del_prop "$cache_rem" "$table"
+    ### TODO ### fi
+
+    ### TODO ### return $ret_code
+}
+
+# Sync two tables (main sync logic)
+function sync_table() {
+    local table="$1"
+    local conn_loc="$2"
+    local conn_rem="$3"
+    local cache_loc="$4"
+    local cache_rem="$5"
+
+    notice $L_STAT "Syncing table $table..."
+
+    # 1. Sync table structures. If they differ, the remote table will be dropped.
+    notice $L_STAT "Syncing table $table structure..."
+    sync_table_structures "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+
+    [[ $STRUCT_CHECK_ONLY == 1 ]] && return
+
+    # 2. Check whether the tables are empty
+    local empty_loc=$(is_empty "$table" "$conn_loc")
+    local empty_rem=$(is_empty "$table" "$conn_rem")
+
+    if [[ $empty_loc == 1 ]]; then
+        # 3. If the local table is empty, truncate the remote and invalidate the cache line.
+        notice $L_INFO "Local table $table empty"
+
+        if [[ $DELETE_REMOTE == 1 ]]; then
+            notice $L_STAT "Truncating table $table in remote database"
+            truncate_table "$table" "$conn_rem" "$cache_rem"
+            local empty_rem=1
+        fi
+
+    else
+        if [[ $empty_rem == 1 ]]; then
+            # 3. If the remote table is empty, invoke copy_table and invalidate the cache line.
+            notice $L_STAT "Remote table $table empty; copying contents..."
+
+            copy_table "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+
+        else
+            # 4. If neither table is empty, they might be different. If we have an mtime column, we skip straight to partitioned sync. Otherwise, we checksum the tables.
+
+            if [[ $(get_prop $mtime_cols $table) != "" ]]; then
+                # 5. There is an mtime column. It's more efficient to try by partition, so we go straight to sync
+                sync_table_contents "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+            else
+                # 5. There is no mtime column. We'll checksum the tables to see if we have any work to do.
+                
+                # If caching is on and we already have the values, we used the cached values. But we always update the caches.
+                local sum_loc= sum_rem=
+                if [[ $CACHE_CKSUMS == 1 ]]; then
+                    sum_loc=$(get_prop $cache_loc $table)
+                    sum_rem=$(get_prop $cache_rem $table)
+                fi
+
+                if [[ $sum_loc == "" ]]; then
+                    notice $L_INFO "Checksumming $table in local database..."
+                    {
+                        lock_loc=$(wait_lock loc $THREADS_LOCAL)
+                        sum=$(echo "checksum table $table;" | eval "mysql -NB $conn_loc" | sed -e 's/^[^.]*\.//' | awk '{print $2}')
+                        release_lock $lock_loc
+                        set_prop "$cache_loc" "$table" "$sum"
+                    } &
+                    local pid_loc=$!
+                fi
+                
+                if [[ $sum_rem == "" ]]; then
+                    notice $L_INFO "Checksumming $table in remote database..."
+                    {
+                        lock_rem=$(wait_lock rem $THREADS_REMOTE)
+                        sum=$(echo "checksum table $table;" | eval "mysql -NB $conn_rem" | sed -e 's/^[^.]*\.//' | awk '{print $2}')
+                        release_lock $lock_rem
+                        set_prop "$cache_rem" "$table" "$sum"
+                    } &
+                    local pid_rem=$!
+                fi
+
+                if [[ $pid_loc != "" || $pid_rem != "" ]]; then
+                    wait $pid_loc $pid_rem
+                fi
+                
+                # Now that we've either determined we're using the cache, or got the latest data and put it in the cache file, we can safely hit the cache
+                sum_loc=$(get_prop $cache_loc $table)
+                sum_rem=$(get_prop $cache_rem $table)
+
+                # Compare the checksums
+                if [[ $sum_loc != $sum_rem ]]; then
+                    notice $L_STAT "Different data in $table locally ($sum_loc) and remotely ($sum_rem); syncing contents..."
+                    sync_table_contents "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+                else
+                    notice $L_INFO "Identical data in $table locally ($sum_loc) and remotely ($sum_rem); not proceeding..."
+                fi
+            fi
+        fi
+    fi
+        
+    # Finally, sync the auto_increment values
+    sync_autoinc "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+}
+
+### Usage and options parsing
+usage="$PROGRAM_NAME [OPTIONS] USER1[/PASS1]@HOST1:DB1 USER2[/PASS2]@HOST2:DB2
+
+$PROGRAM_NAME is a program for Unix-like operating systems to incrementally sync
+structure and data between from one MySQL database to another. $PROGRAM_NAME was
+written with raw performance and simplicity in mind. The sync is only one-way,
+from DB1 to DB2. DB1 is never touched.
+
+The mysql client programs (mysql) must be installed.
+
+OPTIONS:
+    --struct-check-only
+        Only check for different structures, do not inspect or change table data
+        at all. Useful for minor structure differences you want to handle
+        manually rather than allowing the default behaviour (remove and re-create
+        remote table). This overrides options like --drop-tables or --delete.
+
+    -m, --mtime-col TABLE:COL[,TABLE2:COL2 ...]
+        Specify an indexed column, if it exists, designating each row's last-modified
+        time. This will be used to partition the data and avoid synchronising
+        partitions with matching counts. You may specify this option multiple times or
+        specify multiple table:column pairs separated by commas.
+
+    --drop-tables
+        Drop tables in DB2 that are not in DB1
+
+    --delete
+        Delete rows in tables in DB2 that are not in DB1.
+
+    --cache-checksums
+        Cache table checksums and used cached checksums when available. This
+        is useful if $PROGRAM_NAME exits before fully syncing the data. The caches
+        aer kept in HOME.
+
+    -s, --skip-table TABLE
+        Skip TABLE from sync. To skip multiple tables, specify the option
+        multiple times.
+
+    --skip-pattern PATTERN
+        Skip tables matching PATTERN from sync. To skip multiple tables,
+        give the option multiple times.
+    
+    -o, --only TABLE
+        Only sync TABLE. To inclue multiple tables, specify the option multiple
+        times.
+
+    -t, --tmpdir TMPDIR
+        Use TMPDIR as a staging directory instead of \$TMPDIR.
+
+    --net-buffer-length BUFLEN
+        Net buffer length. Default $NET_BUF_LEN. If you are seeing errors, try
+        setting a lower value or checking your server's configuration.
+
+    --max-allowed-packet MAXPKT
+        Maximum allowed packet size. Default $MAX_ALLOWED_PKT. If you are seeing
+        errors, try setting a lower value or checking your server's configuration.
+
+    --threads NUM-THREADS
+        Concurrency of queries against each database. Default value is 4.
+
+    --truncate-table TABLE
+        Truncate TABLE in the remote database. Useful for cache tables that you
+        are not transferring.
+
+    --truncate-pattern PATTERN
+        Truncate tables matching PATTERN in the remote database. See documentation
+        for --truncate-table.
+    
+    -V, --version
+        Print version information
+
+NB. mysql will sometimes store values in tables that do not conform to the table's schema
+and hence cannot be simply copied over with its standard tools. If you get errors due to
+this, please fix the data in your source database first.
+"
+
+if which getopt >/dev/null; then
+    eval set -- "$(getopt -n $PROGRAM_NAME -s bash -l help,version,mtime-col:tmpdir:,struct-check-only,drop-tables,delete,cache-checksums,skip-table:,skip-pattern:,truncate-table:,truncate-pattern:,only:,threads:,threads-local:,threads-remote: hVm:t:s:o: "$@")"
+fi
+
+while [[ ${1:0:1} == - ]]; do
+    case "$1" in
+        --)
+            shift
+            break
+            ;;
+        -h | --help)
+            echo "Usage: $usage" && exit 0 ;;
+
+        -V | --version)
+            echo "$VERSION_STR" && exit 0 ;;
+
+        -m | --mtime-col)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "$2" | tr ':,' ' \n' | grep -v '^$' >> $mtime_cols
+                shift && shift
+            else
+                echo "Please specify TABLE:COLUMN pair(s)"
+                exit 1
+            fi
+            ;;
+
+        -t | --tmpdir)
+            if [[ -d $2 ]]; then
+                STAGING="$2"
+                shift && shift
+            else
+                echo "Please specify valid TMPDIR" >&2
+                exit 2
+            fi
+            ;;
+
+        --struct-check-only)
+            STRUCT_CHECK_ONLY=1 && shift ;;
+
+        --drop-tables)
+            DROP_TABLES=1 && shift ;;
+
+        --delete)
+            DELETE_REMOTE=1 && shift ;;
+
+        --cache-checksums)
+            CACHE_CKSUMS=1 && shift ;;
+
+        -s | --skip-table)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "^$2$" >> $exclude_tables
+                shift && shift
+            else
+                echo "Please specify table to skip"
+                exit 3
+            fi
+            ;;
+
+        --skip-pattern)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "$2" >> $exclude_tables
+                shift && shift
+            else
+                echo "Please specify valid skip pattern"
+                exit 5
+            fi
+            ;;
+
+        --truncate-table)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "^$2$" >> $truncate_tables
+                shift && shift
+            else
+                echo "Please specify table to truncate"
+                exit 3
+            fi
+            ;;
+
+        --truncate-pattern)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "$2" >> $truncate_tables
+                shift && shift
+            else
+                echo "Please specify valid truncate pattern"
+                exit 5
+            fi
+            ;;
+
+        -o | --only)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                echo "^$2$" >> $include_tables
+                shift && shift
+            else
+                echo "Please specify table to sync"
+                exit 4
+            fi
+            ;;
+
+        --threads)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                SYNC_THREADS="$2"
+                shift && shift
+            else
+                echo "Please specify number of threads"
+                exit 6
+            fi
+            ;;
+
+        --threads-local)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                THREADS_LOCAL="$2"
+                shift && shift
+            else
+                echo "Please specify number of local threads"
+                exit 6
+            fi
+            ;;
+
+        --threads-remote)
+            if [[ $2 != "" && ${2:0:1} != - ]]; then
+                THREADS_REMOTE="$2"
+                shift && shift
+            else
+                echo "Please specify number of remote threads"
+                exit 6
+            fi
+            ;;
+
+        *)
+            echo "Unrecognised argument $1" && exit 7 ;;
+
+    esac
+done
+
+if [[ $3 != "" ]]; then
+    echo "Error: superfluous argument(s)"
+    exit 8
+fi
+
+# If --only was not specified, the include pattern file should match everything, so we give it a blank line
+[[ ! -s $include_tables ]] && echo > $include_tables
+
+
+MYSQLDUMP_OPTS="$MYSQLDUMP_DEFAULTS --net_buffer_length=$NET_BUF_LEN --max-allowed-packet=$MAX_ALLOWED_PKT"
+
+
+### Main procedure
+# Exit on errors
+set -e
+
+# Set locale for consistent sort/join behaviour
+export LC_ALL=C
+
+# Parse connection strings
+IFS=":" read conn_loc name_loc < <(parse_connstr "$1")
+IFS=":" read conn_rem name_rem < <(parse_connstr "$2")
+
+cache_loc=$HOME/sums.$name_loc
+cache_rem=$HOME/sums.$name_rem
+
+# Start sync
+date
+notice $L_ALL "Starting sync"
+cd $STAGING
+
+# List tables in each instance
+# Switch off return code checking because of grep's behaviour
+set +e
+echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_loc" | cut -f1 | sort | tee >(grep -f $truncate_tables > $TMP.tables_trunc) |
+                                                                                                       grep -v -f $exclude_tables | grep -f $include_tables > $TMP.tables_loc
+echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_rem" | cut -f1 | sort | grep -v -f $exclude_tables | grep -f $include_tables > $TMP.tables_rem
+set -e
+
+if [[ $STRUCT_CHECK_ONLY != 1 ]]; then
+    notice $L_STAT "Checking for different tables..."
+
+    diff $TMP.tables_loc $TMP.tables_rem | while read type table; do
+        case $type in 
+            "<" )
+                notice $L_STAT "Table doesn't exist remotely: $table: copying structure"
+                copy_table_structure "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+                ;;
+
+            ">" )
+                notice $L_INFO "Table doesn't exist locally: $table"
+                if [[ $DROP_TABLES == 1 ]]; then
+                    notice $L_STAT "Dropping table $table in remote database"
+                    echo "drop table $table;" | eval "mysql $conn_rem"
+                fi
+                ;;
+
+        esac
+    done
+fi
+
+if [[ $STRUCT_CHECK_ONLY != 1 ]]; then
+    while read table; do
+        notice $L_STAT "Truncating table $table in remote database"
+        copy_table_structure "$table" "$conn_loc" "$conn_rem" "$cache_rem"
+    done < $TMP.tables_trunc
+fi
+
+rm -f $TMP.tables_trunc
+
+notice $L_INFO "Checking for differences in table contents..."
+#join $TMP.tables_loc $TMP.tables_rem
+
+join $TMP.tables_loc $TMP.tables_rem > $TMP.tables_common
+
+rm -f $TMP.tables_loc $TMP.tables_rem
+
+# For every common table left, call sync_table
+if [[ ! -s $TMP.tables_common ]]; then
+    echo "There were no pre-existing common tables to compare, sync finished."
+else
+    if [[ $STRUCT_CHECK_ONLY != 1 ]]; then
+        # Because we might be waiting for some db operations, dispatch twice as many sync threads as db threads
+        dispatch_threads=$((SYNC_THREADS * 2))
+        # Need to escape special characters before passing them through xargs. The dollar sign is the only one to worry about.
+        esc_conn_loc=`echo "$conn_loc" | sed -e 's/\\$/\\\\$/g' -e "s/'/\"/g"`
+        esc_conn_rem=`echo "$conn_rem" | sed -e 's/\\$/\\\\$/g' -e "s/'/\"/g"`
+        cat $TMP.tables_common | xargs -P $dispatch_threads -n1 bash -c "sync_table \"\$1\" '$esc_conn_loc' '$conn_rem' '$cache_loc' '$cache_rem' " -- 3>&1
+    fi
+fi
+
+rm -f $TMP.tables_common
+
+wait
+
+notice $L_ALL "Sync finished"
+
+exit 0
+
