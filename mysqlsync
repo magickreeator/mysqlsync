@@ -292,7 +292,7 @@ function copy_table_structure() {
     drop_table "$table" "$conn_rem" "$cache_rem"
 
     # Get local table structure
-    echo "show create table $table;" | eval "mysql -NB $conn_loc" | sed -e 's/.*\(create table\)/\1/i' -e 's/\\n/\n/g' > $TMP.$table.structure
+     $table \G;" | eval "mysql -NB $conn_loc" | awk '{if(NR>2)print}' > $TMP.$table.structure
     
     # Set auto-increment column to zero
     sed -i 's/\(auto_increment\)=[0-9]*/\1=0/gi' $TMP.$table.structure
