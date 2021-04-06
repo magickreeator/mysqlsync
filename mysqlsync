@@ -550,7 +550,7 @@ function copy_table() {
     fi
 
     notice $L_STAT "Copying rows in $partition_notice to remote database"
-    eval "mysqldump --compact --add-locks --disable-keys --extended-insert --no-create-info --lock-tables --quick --set-charset $MYSQLDUMP_OPTS $mysqldump_extra_clause $conn_loc $table" | tee /tmp/lala | pvwrap "$table copy" $total_rows | eval "mysql -C -NB $conn_rem" 2>$TMP.$table.copy_err
+    eval "mysqldump --compact --add-locks --disable-keys --extended-insert --no-create-info --lock-tables --quick --set-charset --set-gtid-purged=OFF $MYSQLDUMP_OPTS $mysqldump_extra_clause $conn_loc $table" | tee /tmp/lala | pvwrap "$table copy" $total_rows | eval "mysql -C -NB $conn_rem" 2>$TMP.$table.copy_err
 
     if [[ -s $TMP.$table.copy_err ]]; then
         notice $L_ALL "Error while copying table $partition_notice $(cat $TMP.$table.copy_err | wc -l) lines):"
