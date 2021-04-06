@@ -1184,9 +1184,9 @@ cd $STAGING
 # List tables in each instance
 # Switch off return code checking because of grep's behaviour
 set +e
-echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_loc" | cut -f1 | sort | tee >(grep -f $truncate_tables > $TMP.tables_trunc) |
+echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_loc" | awk 'NR==4, NR==NR+1 {print $2}' | awk 'NF > 0 { print }' | sort | tee >(grep -f $truncate_tables > $TMP.tables_trunc) |
                                                                                                        grep -v -f $exclude_tables | grep -f $include_tables > $TMP.tables_loc
-echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_rem" | cut -f1 | sort | grep -v -f $exclude_tables | grep -f $include_tables > $TMP.tables_rem
+echo "show full tables where table_type='BASE TABLE';" | eval "mysql -NB $conn_rem" | awk 'NR==4, NR==NR+1 {print $2}' | awk 'NF > 0 { print }' | sort | grep -v -f $exclude_tables | grep -f $include_tables > $TMP.tables_rem
 set -e
 
 if [[ $STRUCT_CHECK_ONLY != 1 ]]; then
